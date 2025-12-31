@@ -1,0 +1,33 @@
+{
+  "name": "command-bd-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Checkpoint commands with semantic search",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "command-bd-mcp": "./server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "api": "node api-server.js"
+  },
+  "keywords": [
+    "mcp",
+    "checkpoint",
+    "semantic-search",
+    "sqlite",
+    "ollama"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.25.1",
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "better-sqlite3": "^11.7.0",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
