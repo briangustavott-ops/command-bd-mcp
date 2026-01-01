@@ -1,5 +1,8 @@
+#!/usr/bin/env node
+
 // server.js
-// MCP Server for Checkpoint commands (HTTP client to API server)
+// MCP Server for Checkpoint commands database
+// Provides tools for Claude to interact with the commands database via HTTP API
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -7,15 +10,37 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import fetch from 'node-fetch';
 
-const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:5679";
+const API_BASE_URL = "http://localhost:5679";
 
-// Create MCP server
+// Helper function to make API requests
+async function apiRequest(endpoint, method = "GET", body = null) {
+  const options = {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+    },
+  };
+
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+
+  const response = await fetch(`${API_BASE_URL}${endpoint}`, options);
+  
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || `API error: ${response.statusText}`);
+  }
+
+  return await response.json();
+}
+
+// Create server instance
 const server = new Server(
   {
-    name: "checkpoint-commands",
-    version: "1.0.0",
+    name: "command-bd-mcp",
+    version: "2.0.0",
   },
   {
     capabilities: {
@@ -24,10 +49,14 @@ const server = new Server(
   }
 );
 
-// List available tools
+// ============================================================================
+// TOOL DEFINITIONS
+// ============================================================================
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
+      // ========== EXISTING TOOLS (UPDATED) ==========
       {
         name: "search_commands",
         description: "Search for Checkpoint commands using semantic search. Provide a natural language description of what you want to do (e.g., 'check cluster status', 'configure firewall rules'). The system will find the most relevant commands.",
@@ -36,18 +65,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             query: {
               type: "string",
-              description: "Natural language description of what you want to do or find"
+              description: "Natural language description of what you want to do or find",
             },
             limit: {
               type: "number",
+              description: "Maximum number of results to return",
               default: 5,
-              description: "Maximum number of results to return"
             },
             score_threshold: {
               type: "number",
+              description: "Minimum similarity score (0-1) to include results",
               default: 0.3,
-              description: "Minimum similarity score (0-1) to include results"
-            }
+            },
           },
           required: ["query"],
         },
@@ -60,65 +89,65 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             command: {
               type: "string",
-              description: "Base command name (e.g., 'cphaprob', 'fw ctl')"
+              description: "Base command name (e.g., 'cphaprob', 'fw ctl')",
             },
             description: {
               type: "string",
-              description: "General description of what the command does"
+              description: "General description of what the command does",
             },
             arguments: {
               type: "array",
+              description: "Array of argument variants with descriptions",
               items: {
                 type: "object",
                 properties: {
                   args: { type: "string" },
-                  description: { type: "string" }
-                }
+                  description: { type: "string" },
+                },
               },
-              description: "Array of argument variants with descriptions"
             },
             category: {
               type: "string",
-              description: "Command category (e.g., 'clusterxl', 'vpn', 'policy')"
+              description: "Command category (e.g., 'clusterxl', 'vpn', 'policy')",
             },
             version: {
               type: "string",
-              description: "Checkpoint version (e.g., 'R80+', 'R81.20')"
+              description: "Checkpoint version (e.g., 'R80+', 'R81.20')",
             },
             keywords: {
               type: "string",
-              description: "Comma-separated keywords for searching"
+              description: "Comma-separated keywords for searching",
             },
             mode: {
               type: "string",
               enum: ["clish", "expert"],
-              description: "Command execution mode"
+              description: "Command execution mode",
             },
             type: {
               type: "string",
               enum: ["config", "query"],
-              description: "Command type"
+              description: "Command type",
             },
             device: {
               type: "string",
               enum: ["firewall", "management"],
-              description: "Target device type"
+              description: "Target device type",
             },
             executable_mcp: {
               type: "boolean",
+              description: "Whether this command can be executed via MCP",
               default: false,
-              description: "Whether this command can be executed via MCP"
             },
             impact: {
               type: "string",
               enum: ["low", "medium", "high", "critical"],
-              description: "Risk level of the command"
+              description: "Risk level of the command",
             },
             related_commands: {
               type: "array",
+              description: "Array of related command IDs",
               items: { type: "number" },
-              description: "Array of related command IDs"
-            }
+            },
           },
           required: ["command", "description"],
         },
@@ -131,7 +160,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             id: {
               type: "number",
-              description: "Command ID to update"
+              description: "Command ID to update",
             },
             command: { type: "string" },
             description: { type: "string" },
@@ -141,9 +170,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                 type: "object",
                 properties: {
                   args: { type: "string" },
-                  description: { type: "string" }
-                }
-              }
+                  description: { type: "string" },
+                },
+              },
             },
             category: { type: "string" },
             version: { type: "string" },
@@ -155,9 +184,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             impact: { type: "string", enum: ["low", "medium", "high", "critical"] },
             related_commands: {
               type: "array",
-              items: { type: "number" }
+              items: { type: "number" },
             },
-            deprecated: { type: "boolean" }
+            deprecated: { type: "boolean" },
           },
           required: ["id"],
         },
@@ -170,8 +199,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             id: {
               type: "number",
-              description: "Command ID to delete"
-            }
+              description: "Command ID to delete",
+            },
           },
           required: ["id"],
         },
@@ -184,347 +213,675 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             id: {
               type: "number",
-              description: "Command ID"
-            }
+              description: "Command ID",
+            },
           },
           required: ["id"],
         },
       },
       {
         name: "list_commands",
-        description: "List all commands with optional filters (category, mode, device, deprecated status)",
+        description: "List all commands with optional filters (category, mode, device, deprecated status, regex, keyword, version)",
         inputSchema: {
           type: "object",
           properties: {
             category: {
               type: "string",
-              description: "Filter by category (e.g., 'clusterxl', 'vpn')"
+              description: "Filter by category (e.g., 'clusterxl', 'vpn')",
             },
             mode: {
               type: "string",
               enum: ["clish", "expert"],
-              description: "Filter by execution mode"
+              description: "Filter by execution mode",
             },
             device: {
               type: "string",
               enum: ["firewall", "management"],
-              description: "Filter by device type"
+              description: "Filter by device type",
             },
             deprecated: {
               type: "boolean",
-              description: "Filter by deprecated status (true/false)"
-            }
+              description: "Filter by deprecated status (true/false)",
+            },
+            regex: {
+              type: "string",
+              description: "Regex pattern to filter command names (e.g., '^cphaprob.*')",
+            },
+            keyword: {
+              type: "string",
+              description: "Keyword to search in keywords field",
+            },
+            version: {
+              type: "string",
+              description: "Filter by Checkpoint version (e.g., 'R80+', 'R81.20')",
+            },
           },
+        },
+      },
+
+      // ========== NEW TOOLS - HIGH PRIORITY ==========
+      {
+        name: "bulk_add_commands",
+        description: "Add multiple commands at once. Commands that already exist (same command+category) will be skipped and reported.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            commands: {
+              type: "array",
+              description: "Array of command objects to add",
+              items: {
+                type: "object",
+                properties: {
+                  command: { type: "string" },
+                  description: { type: "string" },
+                  category: { type: "string" },
+                  arguments: { type: "array" },
+                  version: { type: "string" },
+                  keywords: { type: "string" },
+                  mode: { type: "string" },
+                  type: { type: "string" },
+                  device: { type: "string" },
+                  executable_mcp: { type: "boolean" },
+                  impact: { type: "string" },
+                  related_commands: { type: "array" },
+                },
+                required: ["command", "description", "category"],
+              },
+            },
+          },
+          required: ["commands"],
+        },
+      },
+      {
+        name: "export_commands",
+        description: "Export commands to JSON format. Supports filtering by category, mode, device, deprecated status, and version.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            category: { type: "string" },
+            mode: { type: "string" },
+            device: { type: "string" },
+            deprecated: { type: "boolean" },
+            version: { type: "string" },
+          },
+        },
+      },
+      {
+        name: "import_commands",
+        description: "Import commands from JSON array. Duplicates will be skipped by default.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            commands: {
+              type: "array",
+              description: "Array of command objects to import",
+            },
+            skip_duplicates: {
+              type: "boolean",
+              description: "Skip duplicates instead of updating them",
+              default: true,
+            },
+          },
+          required: ["commands"],
+        },
+      },
+      {
+        name: "get_database_stats",
+        description: "Get comprehensive statistics about the database including total commands, breakdown by category, device, mode, version, and embedding status.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "rebuild_all_embeddings",
+        description: "Rebuild embeddings for all commands in the database. This is useful after bulk updates or database migrations. WARNING: This process may take several minutes.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "rebuild_embedding",
+        description: "Rebuild embedding for a specific command by ID. Useful when command or description has been updated.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            id: {
+              type: "number",
+              description: "Command ID to rebuild embedding for",
+            },
+          },
+          required: ["id"],
+        },
+      },
+      {
+        name: "create_backup",
+        description: "Create a backup of the entire database. The backup is stored in the ./backups directory with a timestamp.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "list_backups",
+        description: "List all available database backups with their file paths.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "restore_backup",
+        description: "Restore the database from a backup file. WARNING: This will replace the current database.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            backup_file: {
+              type: "string",
+              description: "Path to the backup file to restore from",
+            },
+          },
+          required: ["backup_file"],
+        },
+      },
+
+      // ========== NEW TOOLS - MEDIUM PRIORITY ==========
+      {
+        name: "advanced_search",
+        description: "Perform advanced search with multiple filters combined (semantic search + category + device + mode + version + impact).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search query for semantic search",
+            },
+            category: { type: "string" },
+            device: { type: "string" },
+            mode: { type: "string" },
+            version: { type: "string" },
+            impact: { type: "string" },
+            limit: {
+              type: "number",
+              default: 10,
+            },
+            score_threshold: {
+              type: "number",
+              default: 0.3,
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "list_categories",
+        description: "List all unique categories in the database with command counts for each.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "get_category_stats",
+        description: "Get detailed statistics for a specific category including total commands, active vs deprecated, and command list.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            category: {
+              type: "string",
+              description: "Category name to get statistics for",
+            },
+          },
+          required: ["category"],
+        },
+      },
+      {
+        name: "rename_category",
+        description: "Rename a category across all commands. This updates all commands that belong to the old category.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            old_name: {
+              type: "string",
+              description: "Current category name",
+            },
+            new_name: {
+              type: "string",
+              description: "New category name",
+            },
+          },
+          required: ["old_name", "new_name"],
+        },
+      },
+      {
+        name: "find_duplicates",
+        description: "Find duplicate commands (same command name in the same category). Returns groups of duplicates with their IDs.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "validate_database",
+        description: "Validate database integrity. Checks for: commands without embeddings, orphaned embeddings, and missing required fields.",
+        inputSchema: {
+          type: "object",
+          properties: {},
+        },
+      },
+      {
+        name: "optimize_database",
+        description: "Optimize the database by running VACUUM and ANALYZE. This reclaims space and updates statistics for better query performance.",
+        inputSchema: {
+          type: "object",
+          properties: {},
         },
       },
     ],
   };
 });
 
-// Handle tool calls
+// ============================================================================
+// TOOL IMPLEMENTATIONS
+// ============================================================================
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
   try {
-    // SEARCH COMMANDS
-    if (name === "search_commands") {
-      const { query, limit = 5, score_threshold = 0.3 } = args;
-
-      const response = await fetch(`${API_BASE_URL}/api/commands/search`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, limit, score_threshold })
-      });
-
-      const data = await response.json();
-
-      if (data.status === 'error') {
+    switch (name) {
+      // ========== EXISTING TOOLS (UPDATED) ==========
+      
+      case "search_commands": {
+        const result = await apiRequest("/api/commands/search", "POST", {
+          query: args.query,
+          limit: args.limit || 5,
+          score_threshold: args.score_threshold || 0.3,
+        });
+        
         return {
-          content: [{
-            type: "text",
-            text: `Error: ${data.message}`
-          }],
-          isError: true,
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
         };
       }
 
-      const results = data.results;
+      case "add_command": {
+        try {
+          const result = await apiRequest("/api/commands", "POST", args);
+          
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(result, null, 2),
+              },
+            ],
+          };
+        } catch (error) {
+          // Handle duplicate error specially
+          if (error.message.includes("already exists")) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({
+                    status: "error",
+                    error: true,
+                    message: error.message,
+                    suggestion: "Use update_command tool to modify the existing command"
+                  }, null, 2),
+                },
+              ],
+              isError: true,
+            };
+          }
+          throw error;
+        }
+      }
 
-      if (results.length === 0) {
+      case "update_command": {
+        const { id, ...updates } = args;
+        const result = await apiRequest(`/api/commands/${id}`, "PUT", updates);
+        
         return {
-          content: [{
-            type: "text",
-            text: `No commands found for query: "${query}"\n\n(Similarity threshold: ${score_threshold})\n\nTry:\n- Using different keywords\n- Lowering the score_threshold\n- Using list_commands to see all available commands`
-          }],
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
         };
       }
 
-      const formatted = results.map((result, index) => {
-        const argsText = result.arguments.length > 0
-          ? result.arguments.map(a => `    • ${a.args}: ${a.description}`).join('\n')
-          : '    (No arguments defined)';
+      case "delete_command": {
+        const result = await apiRequest(`/api/commands/${args.id}`, "DELETE");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
 
-        return `${index + 1}. ${result.command} [ID: ${result.id}] (Score: ${(result.score * 100).toFixed(1)}%)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-📝 Description: ${result.description || 'N/A'}
-📂 Category: ${result.category || 'N/A'}
-🔧 Mode: ${result.mode || 'N/A'} | Type: ${result.type || 'N/A'}
-🖥️  Device: ${result.device || 'N/A'}
-⚠️  Impact: ${result.impact || 'N/A'}
+      case "get_command": {
+        const result = await apiRequest(`/api/commands/${args.id}`, "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
 
-Arguments:
-${argsText}`;
-      }).join('\n\n');
+      case "list_commands": {
+        const params = new URLSearchParams();
+        
+        if (args.category) params.append("category", args.category);
+        if (args.mode) params.append("mode", args.mode);
+        if (args.device) params.append("device", args.device);
+        if (args.deprecated !== undefined) params.append("deprecated", args.deprecated);
+        if (args.regex) params.append("regex", args.regex);
+        if (args.keyword) params.append("keyword", args.keyword);
+        if (args.version) params.append("version", args.version);
+        
+        const queryString = params.toString();
+        const endpoint = queryString ? `/api/commands?${queryString}` : "/api/commands";
+        
+        const result = await apiRequest(endpoint, "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
 
-      return {
-        content: [{
-          type: "text",
-          text: `🔍 Found ${results.length} command(s) for: "${query}"\n\n${formatted}`
-        }],
-      };
+      // ========== NEW TOOLS - HIGH PRIORITY ==========
+
+      case "bulk_add_commands": {
+        const result = await apiRequest("/api/commands/bulk", "POST", {
+          commands: args.commands,
+        });
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "export_commands": {
+        const params = new URLSearchParams();
+        
+        if (args.category) params.append("category", args.category);
+        if (args.mode) params.append("mode", args.mode);
+        if (args.device) params.append("device", args.device);
+        if (args.deprecated !== undefined) params.append("deprecated", args.deprecated);
+        if (args.version) params.append("version", args.version);
+        
+        const queryString = params.toString();
+        const endpoint = queryString ? `/api/commands/export?${queryString}` : "/api/commands/export";
+        
+        const result = await apiRequest(endpoint, "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "import_commands": {
+        const result = await apiRequest("/api/commands/import", "POST", {
+          commands: args.commands,
+          skip_duplicates: args.skip_duplicates !== false,
+        });
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "get_database_stats": {
+        const result = await apiRequest("/api/stats", "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "rebuild_all_embeddings": {
+        const result = await apiRequest("/api/embeddings/rebuild", "POST");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "rebuild_embedding": {
+        const result = await apiRequest(`/api/embeddings/rebuild/${args.id}`, "POST");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "create_backup": {
+        const result = await apiRequest("/api/backup", "POST");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "list_backups": {
+        const result = await apiRequest("/api/backups", "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "restore_backup": {
+        const result = await apiRequest("/api/restore", "POST", {
+          backup_file: args.backup_file,
+        });
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      // ========== NEW TOOLS - MEDIUM PRIORITY ==========
+
+      case "advanced_search": {
+        const result = await apiRequest("/api/commands/search/advanced", "POST", {
+          query: args.query,
+          category: args.category,
+          device: args.device,
+          mode: args.mode,
+          version: args.version,
+          impact: args.impact,
+          limit: args.limit || 10,
+          score_threshold: args.score_threshold || 0.3,
+        });
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "list_categories": {
+        const result = await apiRequest("/api/categories", "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "get_category_stats": {
+        const result = await apiRequest(`/api/categories/${args.category}/stats`, "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "rename_category": {
+        const result = await apiRequest(`/api/categories/${args.old_name}/rename`, "PUT", {
+          new_name: args.new_name,
+        });
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "find_duplicates": {
+        const result = await apiRequest("/api/commands/duplicates", "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "validate_database": {
+        const result = await apiRequest("/api/maintenance/validate", "GET");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      case "optimize_database": {
+        const result = await apiRequest("/api/maintenance/optimize", "POST");
+        
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(result, null, 2),
+            },
+          ],
+        };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${name}`);
     }
-
-    // ADD COMMAND
-    if (name === "add_command") {
-      const response = await fetch(`${API_BASE_URL}/api/commands`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(args)
-      });
-
-      const data = await response.json();
-
-      if (data.status === 'error') {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: ${data.message}`
-          }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{
-          type: "text",
-          text: `✓ Command added successfully!\n\nID: ${data.id}\nCommand: ${args.command}\nDescription: ${args.description}\n\nEmbedding generated and indexed for semantic search.`
-        }],
-      };
-    }
-
-    // UPDATE COMMAND
-    if (name === "update_command") {
-      const { id, ...updates } = args;
-
-      const response = await fetch(`${API_BASE_URL}/api/commands/${id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updates)
-      });
-
-      const data = await response.json();
-
-      if (data.status === 'error') {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: ${data.message}`
-          }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{
-          type: "text",
-          text: `✓ Command ${id} updated successfully!\n\nUpdated fields: ${Object.keys(updates).join(', ')}`
-        }],
-      };
-    }
-
-    // DELETE COMMAND
-    if (name === "delete_command") {
-      const { id } = args;
-
-      const response = await fetch(`${API_BASE_URL}/api/commands/${id}`, {
-        method: 'DELETE'
-      });
-
-      const data = await response.json();
-
-      if (data.status === 'error') {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: ${data.message}`
-          }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{
-          type: "text",
-          text: `✓ Command ${id} deleted successfully!\n\nAssociated embeddings have been removed.`
-        }],
-      };
-    }
-
-    // GET COMMAND
-    if (name === "get_command") {
-      const { id } = args;
-
-      const response = await fetch(`${API_BASE_URL}/api/commands/${id}`);
-      const data = await response.json();
-
-      if (data.status === 'error') {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: ${data.message}`
-          }],
-          isError: true,
-        };
-      }
-
-      const command = data.command;
-
-      const argsText = command.arguments.length > 0
-        ? command.arguments.map(a => `  • ${a.args}: ${a.description}`).join('\n')
-        : '  (No arguments)';
-
-      const relatedText = command.related_commands.length > 0
-        ? command.related_commands.join(', ')
-        : 'None';
-
-      return {
-        content: [{
-          type: "text",
-          text: `📋 Command Details [ID: ${command.id}]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-Command: ${command.command}
-Description: ${command.description || 'N/A'}
-
-Category: ${command.category || 'N/A'}
-Version: ${command.version || 'N/A'}
-Keywords: ${command.keywords || 'N/A'}
-
-Mode: ${command.mode || 'N/A'}
-Type: ${command.type || 'N/A'}
-Device: ${command.device || 'N/A'}
-
-Executable via MCP: ${command.executable_mcp ? 'Yes' : 'No'}
-Impact: ${command.impact || 'N/A'}
-Deprecated: ${command.deprecated ? 'Yes' : 'No'}
-
-Arguments:
-${argsText}
-
-Related Commands: ${relatedText}
-
-Created: ${command.created_at}
-Updated: ${command.updated_at}`
-        }],
-      };
-    }
-
-    // LIST COMMANDS
-    if (name === "list_commands") {
-      const queryParams = new URLSearchParams();
-      if (args.category) queryParams.append('category', args.category);
-      if (args.mode) queryParams.append('mode', args.mode);
-      if (args.device) queryParams.append('device', args.device);
-      if (args.deprecated !== undefined) queryParams.append('deprecated', args.deprecated.toString());
-
-      const url = `${API_BASE_URL}/api/commands${queryParams.toString() ? '?' + queryParams.toString() : ''}`;
-      const response = await fetch(url);
-      const data = await response.json();
-
-      if (data.status === 'error') {
-        return {
-          content: [{
-            type: "text",
-            text: `Error: ${data.message}`
-          }],
-          isError: true,
-        };
-      }
-
-      const commands = data.commands;
-
-      if (commands.length === 0) {
-        return {
-          content: [{
-            type: "text",
-            text: `No commands found matching the specified filters.`
-          }],
-        };
-      }
-
-      const formatted = commands.map(cmd => 
-        `${cmd.id}. ${cmd.command} [${cmd.category || 'N/A'}] - ${cmd.description || 'No description'}`
-      ).join('\n');
-
-      const filterText = Object.keys(args).length > 0
-        ? `\nFilters: ${JSON.stringify(args)}`
-        : '';
-
-      return {
-        content: [{
-          type: "text",
-          text: `📚 Commands (${commands.length} found)${filterText}\n\n${formatted}\n\nUse get_command with an ID to see full details.`
-        }],
-      };
-    }
-
-    throw new Error(`Unknown tool: ${name}`);
-
   } catch (error) {
-    // Handle connection errors to API server
-    if (error.code === 'ECONNREFUSED' || error.message.includes('fetch failed')) {
-      return {
-        content: [{
-          type: "text",
-          text: `❌ Cannot connect to API server at ${API_BASE_URL}\n\nPlease ensure the API server is running:\n  npm run api\n\nOr check if the server is running on a different port.`
-        }],
-        isError: true,
-      };
-    }
-    
     return {
-      content: [{
-        type: "text",
-        text: `Error: ${error.message}\n\nStack: ${error.stack}`
-      }],
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            error: error.message,
+            stack: error.stack,
+          }, null, 2),
+        },
+      ],
       isError: true,
     };
   }
 });
 
-// Start server
+// ============================================================================
+// START SERVER
+// ============================================================================
+
 async function main() {
-  try {
-    // Check API server availability
-    try {
-      const response = await fetch(`${API_BASE_URL}/health`);
-      const health = await response.json();
-      console.error(`✓ Connected to API server: ${health.service} v${health.version}`);
-    } catch (error) {
-      console.error(`⚠️  Warning: Could not connect to API server at ${API_BASE_URL}`);
-      console.error(`   Make sure api-server.js is running: npm run api`);
-    }
-    
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("Checkpoint Commands MCP Server v1.0.0 running");
-  } catch (error) {
-    console.error("Initialization error:", error);
-    process.exit(1);
-  }
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("Checkpoint Commands MCP Server v2.0.0 running on stdio");
+  console.error("Available tools: 23 (6 existing + 9 high priority + 8 medium priority)");
 }
 
 main().catch((error) => {
-  console.error("Server error:", error);
+  console.error("Fatal error:", error);
   process.exit(1);
 });

@@ -2,11 +2,13 @@
 // SQLite database operations and Ollama embeddings integration
 
 import Database from 'better-sqlite3';
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, copyFileSync } from 'fs';
 import { extractKeywords } from './stopwords.js';
+import { join } from 'path';
 
 const OLLAMA_HOST = "http://localhost:11434";
 const EMBEDDING_MODEL = "nomic-embed-text";
+const BACKUP_DIR = './backups';
 
 /**
  * Initialize database and create tables
@@ -96,10 +98,10 @@ function blobToEmbedding(blob) {
 }
 
 /**
- * Add a new command to database
+ * Add a new command to database with duplicate detection
  * @param {Database} db - Database instance
  * @param {Object} commandData - Command data object
- * @returns {Promise<number>} Inserted command ID
+ * @returns {Promise<Object>} Result object with success/error status
  */
 export async function addCommand(db, commandData) {
   const {
@@ -116,6 +118,34 @@ export async function addCommand(db, commandData) {
     impact,
     related_commands
   } = commandData;
+  
+  // CRITICAL: Validate required fields
+  if (!command || !category) {
+    return {
+      error: true,
+      message: 'Command and category are required fields'
+    };
+  }
+  
+  // CRITICAL: Check for duplicates (same command + category)
+  const duplicateStmt = db.prepare(`
+    SELECT id, command, category, description 
+    FROM checkpoint_commands 
+    WHERE command = ? AND category = ?
+  `);
+  
+  const existingCommand = duplicateStmt.get(command, category);
+  
+  if (existingCommand) {
+    return {
+      error: true,
+      message: `Command '${command}' already exists in category '${category}' with ID ${existingCommand.id}. Please use update_command tool with id=${existingCommand.id} to modify it.`,
+      existing_command_id: existingCommand.id,
+      command: command,
+      category: category,
+      existing_description: existingCommand.description
+    };
+  }
   
   // Insert command
   const stmt = db.prepare(`
@@ -154,7 +184,13 @@ export async function addCommand(db, commandData) {
   embStmt.run(commandId, embeddingBlob);
   
   console.error(`✓ Command added: ${command} (ID: ${commandId})`);
-  return commandId;
+  
+  return {
+    error: false,
+    id: commandId,
+    command: command,
+    category: category
+  };
 }
 
 /**
@@ -340,39 +376,70 @@ export function getCommandById(db, id) {
 }
 
 /**
- * List all commands with optional filters
+ * List all commands with enhanced filters (regex, category, keyword, version, etc.)
  * @param {Database} db - Database instance
- * @param {Object} filters - Optional filters (category, mode, device, etc.)
+ * @param {Object} filters - Optional filters
  * @returns {Array} Array of commands
  */
 export function listCommands(db, filters = {}) {
   let query = 'SELECT * FROM checkpoint_commands WHERE 1=1';
   const params = [];
   
+  // Category filter (exact match)
   if (filters.category) {
     query += ' AND category = ?';
     params.push(filters.category);
   }
   
+  // Mode filter
   if (filters.mode) {
     query += ' AND mode = ?';
     params.push(filters.mode);
   }
   
+  // Device filter
   if (filters.device) {
     query += ' AND device = ?';
     params.push(filters.device);
   }
   
+  // Deprecated filter
   if (filters.deprecated !== undefined) {
     query += ' AND deprecated = ?';
     params.push(filters.deprecated ? 1 : 0);
   }
   
+  // Version filter (exact match)
+  if (filters.version) {
+    query += ' AND version = ?';
+    params.push(filters.version);
+  }
+  
   query += ' ORDER BY category, command';
   
   const stmt = db.prepare(query);
-  const results = stmt.all(...params);
+  let results = stmt.all(...params);
+  
+  // Post-processing filters (regex and keyword)
+  
+  // Regex filter on command name
+  if (filters.regex) {
+    try {
+      const regex = new RegExp(filters.regex);
+      results = results.filter(cmd => regex.test(cmd.command));
+    } catch (error) {
+      console.error(`⚠️  Invalid regex: ${filters.regex}`);
+    }
+  }
+  
+  // Keyword filter (search in keywords field)
+  if (filters.keyword) {
+    const keywordLower = filters.keyword.toLowerCase();
+    results = results.filter(cmd => {
+      if (!cmd.keywords) return false;
+      return cmd.keywords.toLowerCase().includes(keywordLower);
+    });
+  }
   
   return results.map(cmd => ({
     ...cmd,
@@ -381,4 +448,504 @@ export function listCommands(db, filters = {}) {
     executable_mcp: Boolean(cmd.executable_mcp),
     deprecated: Boolean(cmd.deprecated)
   }));
+}
+
+// ============================================================================
+// NEW FUNCTIONS - HIGH PRIORITY
+// ============================================================================
+
+/**
+ * Bulk add commands from array
+ * @param {Database} db - Database instance
+ * @param {Array} commands - Array of command objects
+ * @returns {Promise<Object>} Result with added/skipped counts
+ */
+export async function bulkAddCommands(db, commands) {
+  const results = {
+    added: [],
+    skipped: [],
+    errors: []
+  };
+  
+  for (const cmd of commands) {
+    try {
+      const result = await addCommand(db, cmd);
+      
+      if (result.error) {
+        results.skipped.push({
+          command: cmd.command,
+          category: cmd.category,
+          reason: result.message,
+          existing_id: result.existing_command_id
+        });
+      } else {
+        results.added.push({
+          id: result.id,
+          command: result.command,
+          category: result.category
+        });
+      }
+    } catch (error) {
+      results.errors.push({
+        command: cmd.command,
+        error: error.message
+      });
+    }
+  }
+  
+  console.error(`✓ Bulk add complete: ${results.added.length} added, ${results.skipped.length} skipped, ${results.errors.length} errors`);
+  
+  return results;
+}
+
+/**
+ * Export commands to JSON
+ * @param {Database} db - Database instance
+ * @param {Object} filters - Optional filters
+ * @returns {Array} Array of commands
+ */
+export function exportCommandsJSON(db, filters = {}) {
+  const commands = listCommands(db, filters);
+  console.error(`✓ Exported ${commands.length} commands to JSON`);
+  return commands;
+}
+
+/**
+ * Import commands from JSON array
+ * @param {Database} db - Database instance
+ * @param {Array} commands - Array of command objects
+ * @param {boolean} skipDuplicates - Skip duplicates instead of updating
+ * @returns {Promise<Object>} Import results
+ */
+export async function importCommandsJSON(db, commands, skipDuplicates = true) {
+  if (skipDuplicates) {
+    return await bulkAddCommands(db, commands);
+  } else {
+    // TODO: Implement update mode
+    throw new Error('Update mode not implemented yet');
+  }
+}
+
+/**
+ * Get database statistics
+ * @param {Database} db - Database instance
+ * @returns {Object} Statistics object
+ */
+export function getDatabaseStats(db) {
+  const stats = {};
+  
+  // Total commands
+  const totalStmt = db.prepare('SELECT COUNT(*) as count FROM checkpoint_commands');
+  stats.total_commands = totalStmt.get().count;
+  
+  // Active vs deprecated
+  const activeStmt = db.prepare('SELECT COUNT(*) as count FROM checkpoint_commands WHERE deprecated = 0');
+  stats.active_commands = activeStmt.get().count;
+  stats.deprecated_commands = stats.total_commands - stats.active_commands;
+  
+  // By category
+  const categoryStmt = db.prepare(`
+    SELECT category, COUNT(*) as count 
+    FROM checkpoint_commands 
+    GROUP BY category 
+    ORDER BY count DESC
+  `);
+  stats.by_category = categoryStmt.all();
+  
+  // By device
+  const deviceStmt = db.prepare(`
+    SELECT device, COUNT(*) as count 
+    FROM checkpoint_commands 
+    WHERE device IS NOT NULL
+    GROUP BY device
+  `);
+  stats.by_device = deviceStmt.all();
+  
+  // By mode
+  const modeStmt = db.prepare(`
+    SELECT mode, COUNT(*) as count 
+    FROM checkpoint_commands 
+    WHERE mode IS NOT NULL
+    GROUP BY mode
+  `);
+  stats.by_mode = modeStmt.all();
+  
+  // By version
+  const versionStmt = db.prepare(`
+    SELECT version, COUNT(*) as count 
+    FROM checkpoint_commands 
+    WHERE version IS NOT NULL
+    GROUP BY version
+    ORDER BY count DESC
+  `);
+  stats.by_version = versionStmt.all();
+  
+  // Embeddings count
+  const embStmt = db.prepare('SELECT COUNT(*) as count FROM command_embeddings');
+  stats.total_embeddings = embStmt.get().count;
+  
+  console.error(`✓ Database stats generated`);
+  
+  return stats;
+}
+
+/**
+ * Rebuild all embeddings
+ * @param {Database} db - Database instance
+ * @returns {Promise<Object>} Rebuild results
+ */
+export async function rebuildAllEmbeddings(db) {
+  const commands = db.prepare('SELECT id, command, description FROM checkpoint_commands').all();
+  
+  let success = 0;
+  let failed = 0;
+  
+  for (const cmd of commands) {
+    try {
+      const textToEmbed = `${cmd.command} ${cmd.description || ''}`.trim();
+      const embedding = await getEmbedding(textToEmbed);
+      const embeddingBlob = embeddingToBlob(embedding);
+      
+      // Delete old embedding if exists
+      db.prepare('DELETE FROM command_embeddings WHERE command_id = ?').run(cmd.id);
+      
+      // Insert new embedding
+      db.prepare('INSERT INTO command_embeddings (command_id, embedding) VALUES (?, ?)').run(cmd.id, embeddingBlob);
+      
+      success++;
+      console.error(`✓ Rebuilt embedding for ID ${cmd.id}: ${cmd.command}`);
+    } catch (error) {
+      failed++;
+      console.error(`✗ Failed to rebuild embedding for ID ${cmd.id}: ${error.message}`);
+    }
+  }
+  
+  console.error(`✓ Rebuild complete: ${success} success, ${failed} failed`);
+  
+  return {
+    total: commands.length,
+    success,
+    failed
+  };
+}
+
+/**
+ * Rebuild embedding for specific command
+ * @param {Database} db - Database instance
+ * @param {number} id - Command ID
+ * @returns {Promise<boolean>} Success status
+ */
+export async function rebuildEmbeddingById(db, id) {
+  const cmd = db.prepare('SELECT command, description FROM checkpoint_commands WHERE id = ?').get(id);
+  
+  if (!cmd) {
+    throw new Error(`Command with ID ${id} not found`);
+  }
+  
+  const textToEmbed = `${cmd.command} ${cmd.description || ''}`.trim();
+  const embedding = await getEmbedding(textToEmbed);
+  const embeddingBlob = embeddingToBlob(embedding);
+  
+  // Delete old embedding
+  db.prepare('DELETE FROM command_embeddings WHERE command_id = ?').run(id);
+  
+  // Insert new embedding
+  db.prepare('INSERT INTO command_embeddings (command_id, embedding) VALUES (?, ?)').run(id, embeddingBlob);
+  
+  console.error(`✓ Rebuilt embedding for ID ${id}: ${cmd.command}`);
+  
+  return true;
+}
+
+/**
+ * Create database backup
+ * @param {Database} db - Database instance
+ * @returns {Object} Backup info
+ */
+export function createBackup(db) {
+  // Ensure backup directory exists
+  if (!existsSync(BACKUP_DIR)) {
+    mkdirSync(BACKUP_DIR, { recursive: true });
+  }
+  
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupFile = join(BACKUP_DIR, `commands_backup_${timestamp}.db`);
+  
+  // Use SQLite backup API
+  db.backup(backupFile);
+  
+  console.error(`✓ Backup created: ${backupFile}`);
+  
+  return {
+    backup_file: backupFile,
+    timestamp: new Date().toISOString()
+  };
+}
+
+/**
+ * List all backups
+ * @returns {Array} Array of backup files
+ */
+export function listBackups() {
+  if (!existsSync(BACKUP_DIR)) {
+    return [];
+  }
+  
+  const files = readdirSync(BACKUP_DIR)
+    .filter(f => f.endsWith('.db'))
+    .map(f => join(BACKUP_DIR, f));
+  
+  console.error(`✓ Found ${files.length} backup(s)`);
+  
+  return files;
+}
+
+/**
+ * Restore database from backup
+ * @param {Database} db - Database instance
+ * @param {string} backupFile - Backup file path
+ * @returns {boolean} Success status
+ */
+export function restoreBackup(db, backupFile) {
+  if (!existsSync(backupFile)) {
+    throw new Error(`Backup file not found: ${backupFile}`);
+  }
+  
+  // Close current database
+  const dbPath = db.name;
+  db.close();
+  
+  // Copy backup to database file
+  copyFileSync(backupFile, dbPath);
+  
+  console.error(`✓ Database restored from: ${backupFile}`);
+  
+  return true;
+}
+
+// ============================================================================
+// NEW FUNCTIONS - MEDIUM PRIORITY
+// ============================================================================
+
+/**
+ * Advanced search with multiple filters
+ * @param {Database} db - Database instance
+ * @param {Object} searchParams - Search parameters
+ * @returns {Promise<Array>} Search results
+ */
+export async function advancedSearch(db, searchParams) {
+  const {
+    query,
+    category,
+    device,
+    mode,
+    version,
+    impact,
+    limit = 10,
+    score_threshold = 0.3
+  } = searchParams;
+  
+  // Start with semantic search
+  let results = await searchCommands(db, query, limit * 2, score_threshold);
+  
+  // Apply additional filters
+  if (category) {
+    results = results.filter(r => r.category === category);
+  }
+  
+  if (device) {
+    results = results.filter(r => r.device === device);
+  }
+  
+  if (mode) {
+    results = results.filter(r => r.mode === mode);
+  }
+  
+  if (version) {
+    const cmd = db.prepare('SELECT id FROM checkpoint_commands WHERE id = ? AND version = ?');
+    results = results.filter(r => cmd.get(r.id, version));
+  }
+  
+  if (impact) {
+    results = results.filter(r => r.impact === impact);
+  }
+  
+  console.error(`✓ Advanced search complete: ${results.length} results`);
+  
+  return results.slice(0, limit);
+}
+
+/**
+ * List all unique categories
+ * @param {Database} db - Database instance
+ * @returns {Array} Array of categories
+ */
+export function listCategories(db) {
+  const stmt = db.prepare(`
+    SELECT DISTINCT category, COUNT(*) as count 
+    FROM checkpoint_commands 
+    WHERE category IS NOT NULL
+    GROUP BY category 
+    ORDER BY category
+  `);
+  
+  const categories = stmt.all();
+  
+  console.error(`✓ Found ${categories.length} categories`);
+  
+  return categories;
+}
+
+/**
+ * Get statistics for a specific category
+ * @param {Database} db - Database instance
+ * @param {string} category - Category name
+ * @returns {Object} Category statistics
+ */
+export function getCategoryStats(db, category) {
+  const stats = {};
+  
+  // Total commands in category
+  const totalStmt = db.prepare('SELECT COUNT(*) as count FROM checkpoint_commands WHERE category = ?');
+  stats.total_commands = totalStmt.get(category).count;
+  
+  // Active vs deprecated
+  const activeStmt = db.prepare('SELECT COUNT(*) as count FROM checkpoint_commands WHERE category = ? AND deprecated = 0');
+  stats.active_commands = activeStmt.get(category).count;
+  stats.deprecated_commands = stats.total_commands - stats.active_commands;
+  
+  // Commands list
+  const commandsStmt = db.prepare('SELECT command FROM checkpoint_commands WHERE category = ? ORDER BY command');
+  stats.commands = commandsStmt.all(category).map(c => c.command);
+  
+  console.error(`✓ Category stats for '${category}': ${stats.total_commands} commands`);
+  
+  return stats;
+}
+
+/**
+ * Rename a category
+ * @param {Database} db - Database instance
+ * @param {string} oldName - Old category name
+ * @param {string} newName - New category name
+ * @returns {number} Number of commands updated
+ */
+export function renameCategory(db, oldName, newName) {
+  const stmt = db.prepare('UPDATE checkpoint_commands SET category = ? WHERE category = ?');
+  const result = stmt.run(newName, oldName);
+  
+  console.error(`✓ Renamed category '${oldName}' to '${newName}': ${result.changes} commands updated`);
+  
+  return result.changes;
+}
+
+/**
+ * Find duplicate commands (same command name in same category)
+ * @param {Database} db - Database instance
+ * @returns {Array} Array of duplicate groups
+ */
+export function findDuplicates(db) {
+  const stmt = db.prepare(`
+    SELECT command, category, COUNT(*) as count, GROUP_CONCAT(id) as ids
+    FROM checkpoint_commands
+    GROUP BY command, category
+    HAVING count > 1
+    ORDER BY count DESC, category, command
+  `);
+  
+  const duplicates = stmt.all().map(dup => ({
+    command: dup.command,
+    category: dup.category,
+    count: dup.count,
+    ids: dup.ids.split(',').map(id => parseInt(id))
+  }));
+  
+  console.error(`✓ Found ${duplicates.length} duplicate groups`);
+  
+  return duplicates;
+}
+
+/**
+ * Validate database integrity
+ * @param {Database} db - Database instance
+ * @returns {Object} Validation results
+ */
+export function validateDatabase(db) {
+  const issues = [];
+  
+  // Check for commands without embeddings
+  const noEmbStmt = db.prepare(`
+    SELECT cc.id, cc.command 
+    FROM checkpoint_commands cc
+    LEFT JOIN command_embeddings ce ON cc.id = ce.command_id
+    WHERE ce.command_id IS NULL
+  `);
+  const noEmbeddings = noEmbStmt.all();
+  
+  if (noEmbeddings.length > 0) {
+    issues.push({
+      type: 'missing_embeddings',
+      count: noEmbeddings.length,
+      commands: noEmbeddings
+    });
+  }
+  
+  // Check for orphaned embeddings
+  const orphanStmt = db.prepare(`
+    SELECT ce.command_id 
+    FROM command_embeddings ce
+    LEFT JOIN checkpoint_commands cc ON ce.command_id = cc.id
+    WHERE cc.id IS NULL
+  `);
+  const orphanedEmbeddings = orphanStmt.all();
+  
+  if (orphanedEmbeddings.length > 0) {
+    issues.push({
+      type: 'orphaned_embeddings',
+      count: orphanedEmbeddings.length,
+      command_ids: orphanedEmbeddings.map(e => e.command_id)
+    });
+  }
+  
+  // Check for commands without required fields
+  const noRequiredStmt = db.prepare(`
+    SELECT id, command, category 
+    FROM checkpoint_commands 
+    WHERE command IS NULL OR command = '' OR category IS NULL OR category = ''
+  `);
+  const noRequired = noRequiredStmt.all();
+  
+  if (noRequired.length > 0) {
+    issues.push({
+      type: 'missing_required_fields',
+      count: noRequired.length,
+      commands: noRequired
+    });
+  }
+  
+  const isValid = issues.length === 0;
+  
+  console.error(isValid ? '✓ Database validation passed' : `⚠️  Database validation found ${issues.length} issue(s)`);
+  
+  return {
+    valid: isValid,
+    issues: issues,
+    total_issues: issues.reduce((sum, issue) => sum + issue.count, 0)
+  };
+}
+
+/**
+ * Optimize database (VACUUM and ANALYZE)
+ * @param {Database} db - Database instance
+ * @returns {boolean} Success status
+ */
+export function optimizeDatabase(db) {
+  console.error('🔧 Optimizing database...');
+  
+  db.exec('VACUUM');
+  db.exec('ANALYZE');
+  
+  console.error('✓ Database optimized');
+  
+  return true;
 }
